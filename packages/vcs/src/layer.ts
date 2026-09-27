@@ -437,34 +437,65 @@ export async function buildShadowVcs(backend: VcsBackend, worktreePath: string, 
           return filterDeltaBySelector(delta, options.pathFilter)
         }
 
-        // Worktree is dirty — show worktree changes vs the 'against' checkpoint
-        let changedFiles = worktreeChanges
+        // Worktree is dirty — show worktree changes vs the 'against' checkpoint.
+        // The worktree status only covers changes since HEAD, so when 'against'
+        // is older than HEAD also include the paths committed in between.
+        const headHash = yield* backend.readRef("HEAD").pipe(
+          Effect.mapError(mapBackendErr("readRef")),
+        )
+        const headCommits = headHash === null
+          ? []
+          : yield* backend.walkHistory({ start: headHash, limit: 1 }).pipe(
+              Effect.mapError(mapBackendErr("walkHistory")),
+            )
+        const committedPaths = headCommits.length > 0 && headCommits[0]!.tree !== againstTree
+          ? (yield* backend.diffTree(againstTree, headCommits[0]!.tree).pipe(
+              Effect.mapError(mapBackendErr("diffTree")),
+            )).files.map(f => f.path)
+          : []
+
+        let candidatePaths = [...new Set([...committedPaths, ...worktreeChanges.map(cf => cf.path)])]
         if (options.pathFilter) {
           const matches = createPathSelectorPredicate(options.pathFilter)
-          changedFiles = changedFiles.filter(cf => matches(cf.path))
+          candidatePaths = candidatePaths.filter(p => matches(p))
         }
 
-        // Batch read all old and new content
+        // Batch read all old (checkpoint) and new (worktree) content
         const oldContents: Array<Uint8Array | null> = yield* Effect.all(
-          changedFiles.map(cf =>
-            cf.status !== "added"
-              ? backend.readFileAt(againstTree, cf.path).pipe(
-                  Effect.mapError(mapBackendErr("readFileAt")),
-                  Effect.orElse(() => Effect.succeed(null)),
-                )
-              : Effect.succeed(null),
+          candidatePaths.map(p =>
+            backend.readFileAt(againstTree, p).pipe(
+              Effect.mapError(mapBackendErr("readFileAt")),
+              Effect.orElse(() => Effect.succeed(null)),
+            ),
           ),
         )
         const newContents: Array<Uint8Array | null> = yield* Effect.all(
-          changedFiles.map(cf =>
-            cf.status !== "deleted"
-              ? backend.readWorktreeFile(cf.path).pipe(
-                  Effect.mapError(mapBackendErr("readWorktreeFile")),
-                  Effect.orElse(() => Effect.succeed(null)),
-                )
-              : Effect.succeed(null),
+          candidatePaths.map(p =>
+            backend.readWorktreeFile(p).pipe(
+              Effect.mapError(mapBackendErr("readWorktreeFile")),
+              Effect.orElse(() => Effect.succeed(null)),
+            ),
           ),
         )
+
+        const sameBytes = (a: Uint8Array, b: Uint8Array) =>
+          a.length === b.length && a.every((byte, i) => byte === b[i])
+
+        const changedFiles: Array<{ path: string; status: "added" | "deleted" | "modified" }> = []
+        const changedOld: Array<Uint8Array | null> = []
+        const changedNew: Array<Uint8Array | null> = []
+        for (let i = 0; i < candidatePaths.length; i++) {
+          const oldBytes = oldContents[i] ?? null
+          const newBytes = newContents[i] ?? null
+          if (oldBytes === null && newBytes === null) continue
+          if (oldBytes !== null && newBytes !== null && sameBytes(oldBytes, newBytes)) continue
+          changedFiles.push({
+            path: candidatePaths[i]!,
+            status: oldBytes === null ? "added" : newBytes === null ? "deleted" : "modified",
+          })
+          changedOld.push(oldBytes)
+          changedNew.push(newBytes)
+        }
 
         let additions = 0
         let deletions = 0
@@ -479,8 +510,8 @@ export async function buildShadowVcs(backend: VcsBackend, worktreePath: string, 
 
         for (let i = 0; i < changedFiles.length; i++) {
           const cf = changedFiles[i]!
-          const oldBytes = oldContents[i]
-          const newBytes = newContents[i]
+          const oldBytes = changedOld[i]
+          const newBytes = changedNew[i]
           const patch = createContentPatch(cf.path, oldBytes ?? null, newBytes ?? null)
 
           if (cf.status === "added") additions++
