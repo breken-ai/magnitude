@@ -76,12 +76,13 @@ function parseTimeString(timeStr: string, timezone: string): Option.Option<Date>
 }
 
 /**
- * Get the timezone offset in milliseconds for a given ISO-ish datetime string
- * in the specified timezone. Used to convert a local-time string to UTC.
+ * Get the UTC offset in milliseconds (positive east of UTC) of the specified
+ * timezone around a given ISO-ish wall-clock datetime string. Used to convert
+ * a local-time string to UTC. Independent of the host timezone.
  */
 function getTimezoneOffsetMs(isoLocal: string, timezone: string): Option.Option<number> {
   try {
-    const dt = new Date(isoLocal)
+    const dt = new Date(isoLocal + 'Z')
     // Use Intl to format the same instant in the target timezone
     const formatter = new Intl.DateTimeFormat('en-GB', {
       timeZone: timezone,
@@ -103,8 +104,8 @@ function getTimezoneOffsetMs(isoLocal: string, timezone: string): Option.Option<
     const ss = get('second')
     if (!yyyy || !MM || !dd || !hh || !mm || !ss) return Option.none()
 
-    const localInTz = new Date(`${yyyy}-${MM}-${dd}T${hh}:${mm}:${ss}`)
-    return Option.some(dt.getTime() - localInTz.getTime())
+    const localInTz = new Date(`${yyyy}-${MM}-${dd}T${hh}:${mm}:${ss}Z`)
+    return Option.some(localInTz.getTime() - dt.getTime())
   } catch {
     return Option.none()
   }
